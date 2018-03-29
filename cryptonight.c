@@ -16,11 +16,110 @@
 #include "crypto/hash-ops.h"
 
 #define MEMORY         (1 << 21) /* 2 MiB */
+#define MEMORY_NEW     (1 << 24) // 16MB scratchpad
 #define ITER           (1 << 20)
 #define AES_BLOCK_SIZE  16
 #define AES_KEY_SIZE    32 /*16*/
 #define INIT_SIZE_BLK   8
 #define INIT_SIZE_BYTE (INIT_SIZE_BLK * AES_BLOCK_SIZE)
+
+typedef struct {
+	unsigned long long data[4];
+} FourInt64;
+
+#include <emmintrin.h>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#include <windows.h>
+#define STATIC
+#define INLINE __inline
+#if !defined(RDATA_ALIGN16)
+#define RDATA_ALIGN16 __declspec(align(16))
+#endif
+#elif defined(__MINGW32__)
+#include <intrin.h>
+#include <windows.h>
+#define STATIC static
+#define INLINE inline
+#if !defined(RDATA_ALIGN16)
+#define RDATA_ALIGN16 __attribute__ ((aligned(16)))
+#endif
+#else
+#include <sys/mman.h>
+#define STATIC static
+#define INLINE inline
+#if !defined(RDATA_ALIGN16)
+#define RDATA_ALIGN16 __attribute__ ((aligned(16)))
+#endif
+#endif
+
+#if defined(__INTEL_COMPILER)
+#define ASM __asm__
+#elif !defined(_MSC_VER)
+#define ASM __asm__
+#else
+#define ASM __asm
+#endif
+
+#define TOTALBLOCKS (MEMORY / AES_BLOCK_SIZE)
+
+#define U64(x) ((uint64_t *) (x))
+#define R128(x) ((__m128i *) (x))
+
+#define state_index(x) (((*((uint64_t *)x) >> 4) & (TOTALBLOCKS - 1)) << 4)
+#if defined(_MSC_VER)
+#if !defined(_WIN64)
+#define __mul() lo = mul128(c[0], b[0], &hi);
+#else
+#define __mul() lo = _umul128(c[0], b[0], &hi);
+#endif
+#else
+#if defined(__x86_64__)
+#define __mul() ASM("mulq %3\n\t" : "=d"(hi), "=a"(lo) : "%a" (c[0]), "rm" (b[0]) : "cc");
+#else
+#define __mul() lo = mul128(c[0], b[0], &hi);
+#endif
+#endif
+
+#define pre_aes() \
+  j = state_index(a); \
+  _c = _mm_load_si128(R128(&hp_state[j])); \
+  _a = _mm_load_si128(R128(a)); \
+
+/*
+ * An SSE-optimized implementation of the second half of CryptoNight step 3.
+ * After using AES to mix a scratchpad value into _c (done by the caller),
+ * this macro xors it with _b and stores the result back to the same index (j) that it
+ * loaded the scratchpad value from.  It then performs a second random memory
+ * read/write from the scratchpad, but this time mixes the values using a 64
+ * bit multiply.
+ * This code is based upon an optimized implementation by dga.
+ */
+#define post_aes() \
+  _mm_store_si128(R128(c), _c); \
+  _b = _mm_xor_si128(_b, _c); \
+  _mm_store_si128(R128(&hp_state[j]), _b); \
+  j = state_index(c); \
+  p = U64(&hp_state[j]); \
+  b[0] = p[0]; b[1] = p[1]; \
+  __mul(); \
+  a[0] += hi; a[1] += lo; \
+  p = U64(&hp_state[j]); \
+  p[0] = a[0];  p[1] = a[1]; \
+  a[0] ^= b[0]; a[1] ^= b[1]; \
+  _b = _c; \
+
+#if defined(_MSC_VER)
+#define THREADV __declspec(thread)
+#else
+#define THREADV __thread
+#endif
+
+THREADV uint8_t *hp_state = NULL;
+THREADV int hp_allocated = 0;
+THREADV FourInt64 *hp_state_new = NULL;
+THREADV int hp_allocated_new = 0;
 
 #define VARIANT1_1(p) \
   do if (variant > 0) \
@@ -136,6 +235,31 @@ static inline void xor_blocks_dst(const uint8_t* a, const uint8_t* b, uint8_t* d
     ((uint64_t*) dst)[1] = ((uint64_t*) a)[1] ^ ((uint64_t*) b)[1];
 }
 
+/**
+ * @brief uses cpuid to determine if the CPU supports the AES instructions
+ * @return true if the CPU supports AES, false otherwise
+ */
+
+STATIC INLINE int force_software_aes(void)
+{
+  static int use = -1;
+
+  if (use != -1)
+    return use;
+
+  const char *env = getenv("MONERO_USE_SOFTWARE_AES");
+  if (!env) {
+    use = 0;
+  }
+  else if (!strcmp(env, "0") || !strcmp(env, "no")) {
+    use = 0;
+  }
+  else {
+    use = 1;
+  }
+  return use;
+}
+
 struct cryptonight_ctx {
     uint8_t long_state[MEMORY];
     union cn_slow_hash_state state;
@@ -147,7 +271,258 @@ struct cryptonight_ctx {
     oaes_ctx* aes_ctx;
 };
 
+void slow_hash_allocate_state(void)
+{
+    if(hp_state != NULL)
+        return;
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    SetLockPagesPrivilege(GetCurrentProcess(), TRUE);
+    hp_state = (uint8_t *) VirtualAlloc(hp_state, MEMORY, MEM_LARGE_PAGES |
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+  defined(__DragonFly__)
+    hp_state = mmap(0, MEMORY, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, 0, 0);
+#else
+    hp_state = mmap(0, MEMORY, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, 0, 0);
+#endif
+    if(hp_state == MAP_FAILED)
+        hp_state = NULL;
+#endif
+    hp_allocated = 1;
+    if(hp_state == NULL)
+    {
+        hp_allocated = 0;
+        hp_state = (uint8_t *) malloc(MEMORY);
+    }
+}
+void slow_hash_free_state(void)
+{
+    if(hp_state == NULL)
+        return;
+
+    if(!hp_allocated)
+        free(hp_state);
+    else
+    {
+#if defined(_MSC_VER) || defined(__MINGW32__)
+        VirtualFree(hp_state, MEMORY, MEM_RELEASE);
+#else
+        munmap(hp_state, MEMORY);
+#endif
+    }
+
+    hp_state = NULL;
+    hp_allocated = 0;
+}
+
+void slow_hash_allocate_state_new(void)
+{
+    if(hp_state_new != NULL)
+        return;
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    SetLockPagesPrivilege(GetCurrentProcess(), TRUE);
+    hp_state_new = (FourInt64 *) VirtualAlloc(hp_state_new, MEMORY_NEW, MEM_LARGE_PAGES |
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+  defined(__DragonFly__)
+    hp_state_new = mmap(0, MEMORY_NEW, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, 0, 0);
+#else
+    hp_state_new = mmap(0, MEMORY_NEW, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, 0, 0);
+#endif
+    if(hp_state_new == MAP_FAILED)
+        hp_state_new = NULL;
+#endif
+    hp_allocated_new = 1;
+    if(hp_state_new == NULL)
+    {
+        hp_allocated_new = 0;
+        hp_state_new = (FourInt64 *) malloc(MEMORY_NEW);
+    }
+}
+
+void slow_hash_free_state_new(void)
+{
+    if(hp_state_new == NULL)
+        return;
+
+    if(!hp_allocated_new)
+        free(hp_state_new);
+    else
+    {
+#if defined(_MSC_VER) || defined(__MINGW32__)
+        VirtualFree(hp_state_new, MEMORY_NEW, MEM_RELEASE);
+#else
+        munmap(hp_state_new, MEMORY_NEW);
+#endif
+    }
+
+    hp_state_new = NULL;
+    hp_allocated_new = 0;
+}
+
+void cn_slow_hash(const void *data, size_t length, char *hash)
+{
+    RDATA_ALIGN16 uint8_t expandedKey[240];  /* These buffers are aligned to use later with SSE functions */
+
+    uint8_t text[INIT_SIZE_BYTE];
+    RDATA_ALIGN16 uint64_t a[2];
+    RDATA_ALIGN16 uint64_t b[2];
+    RDATA_ALIGN16 uint64_t c[2];
+    union cn_slow_hash_state state;
+    __m128i _a, _b, _c;
+    uint64_t hi, lo;
+
+    size_t i, j;
+    uint64_t *p = NULL;
+    oaes_ctx *aes_ctx = NULL;
+
+    // this isn't supposed to happen, but guard against it for now.
+    if(hp_state == NULL)
+        slow_hash_allocate_state();
+    if(hp_state_new == NULL)
+        slow_hash_allocate_state_new();
+    memset(hp_state_new, 0, MEMORY_NEW);
+
+    /* CryptoNight Step 1:  Use Keccak1600 to initialize the 'state' (and 'text') buffers from the data. */
+
+    hash_process(&state.hs, data, length);
+    memcpy(text, state.init, INIT_SIZE_BYTE);
+
+    /* CryptoNight Step 2:  Iteratively encrypt the results from Keccak to fill
+     * the 2MB large random access buffer.
+     */
+    {
+        aes_ctx = (oaes_ctx *) oaes_alloc();
+        oaes_key_import_data(aes_ctx, state.hs.b, AES_KEY_SIZE);
+        for(i = 0; i < MEMORY / INIT_SIZE_BYTE; i++)
+        {
+            for(j = 0; j < INIT_SIZE_BLK; j++)
+                aesb_pseudo_round(&text[AES_BLOCK_SIZE * j], &text[AES_BLOCK_SIZE * j], aes_ctx->key->exp_data);
+
+            memcpy(&hp_state[i * INIT_SIZE_BYTE], text, INIT_SIZE_BYTE);
+        }
+    }
+
+    U64(a)[0] = U64(&state.k[0])[0] ^ U64(&state.k[32])[0];
+    U64(a)[1] = U64(&state.k[0])[1] ^ U64(&state.k[32])[1];
+    U64(b)[0] = U64(&state.k[16])[0] ^ U64(&state.k[48])[0];
+    U64(b)[1] = U64(&state.k[16])[1] ^ U64(&state.k[48])[1];
+
+    /* CryptoNight Step 3:  Bounce randomly 1,048,576 times (1<<20) through the mixing buffer,
+     * using 524,288 iterations of the following mixing function.  Each execution
+     * performs two reads and writes from the mixing buffer.
+     */
+
+    _b = _mm_load_si128(R128(b));
+    // Two independent versions, one with AES, one without, to ensure that
+    // the useAes test is only performed once, not every iteration.
+    {
+        for(i = 0; i < ITER / 2; i++)
+        {
+            pre_aes();
+            aesb_single_round((uint8_t *) &_c, (uint8_t *) &_c, (uint8_t *) &_a);
+            post_aes();
+
+			//New Code begin
+			hp_state_new[c[0]%(512*1024)].data[0]=a[0];
+			hp_state_new[c[0]%(512*1024)].data[1]=a[1];
+			hp_state_new[c[0]%(512*1024)].data[2]=b[0];
+			hp_state_new[c[0]%(512*1024)].data[3]=b[1];
+			//New Code end
+        }
+    }
+
+    /* CryptoNight Step 4:  Sequentially pass through the mixing buffer and use 10 rounds
+     * of AES encryption to mix the random data back into the 'text' buffer.  'text'
+     * was originally created with the output of Keccak1600. */
+
+    memcpy(text, state.init, INIT_SIZE_BYTE);
+
+    {
+        oaes_key_import_data(aes_ctx, &state.hs.b[32], AES_KEY_SIZE);
+        for(i = 0; i < MEMORY / INIT_SIZE_BYTE; i++)
+        {
+            for(j = 0; j < INIT_SIZE_BLK; j++)
+            {
+                xor_blocks(&text[j * AES_BLOCK_SIZE], &hp_state[i * INIT_SIZE_BYTE + j * AES_BLOCK_SIZE]);
+                aesb_pseudo_round(&text[AES_BLOCK_SIZE * j], &text[AES_BLOCK_SIZE * j], aes_ctx->key->exp_data);
+            }
+        }
+        oaes_free((OAES_CTX **) &aes_ctx);
+    }
+
+	//New Code begin
+	FourInt64 Y;
+	Y.data[3]=Y.data[2]=Y.data[1]=Y.data[0]=0xcbf29ce484222325ULL;
+	for(int i=0; i<512*1024; i++) {
+		Y.data[3]=(Y.data[3]*0x100000001b3ULL)^hp_state_new[i].data[3];
+		Y.data[2]=(Y.data[2]*0x100000001b3ULL)^hp_state_new[i].data[2];
+		Y.data[1]=(Y.data[1]*0x100000001b3ULL)^hp_state_new[i].data[1];
+		Y.data[0]=(Y.data[0]*0x100000001b3ULL)^hp_state_new[i].data[0];
+	}
+	text[8*0+0]^=((Y.data[0]>>(8*0))&0xFF);
+	text[8*0+1]^=((Y.data[0]>>(8*1))&0xFF);
+	text[8*0+2]^=((Y.data[0]>>(8*2))&0xFF);
+	text[8*0+3]^=((Y.data[0]>>(8*3))&0xFF);
+	text[8*0+4]^=((Y.data[0]>>(8*4))&0xFF);
+	text[8*0+5]^=((Y.data[0]>>(8*5))&0xFF);
+	text[8*0+6]^=((Y.data[0]>>(8*6))&0xFF);
+	text[8*0+7]^=((Y.data[0]>>(8*7))&0xFF);
+
+	text[8*1+0]^=((Y.data[1]>>(8*0))&0xFF);
+	text[8*1+1]^=((Y.data[1]>>(8*1))&0xFF);
+	text[8*1+2]^=((Y.data[1]>>(8*2))&0xFF);
+	text[8*1+3]^=((Y.data[1]>>(8*3))&0xFF);
+	text[8*1+4]^=((Y.data[1]>>(8*4))&0xFF);
+	text[8*1+5]^=((Y.data[1]>>(8*5))&0xFF);
+	text[8*1+6]^=((Y.data[1]>>(8*6))&0xFF);
+	text[8*1+7]^=((Y.data[1]>>(8*7))&0xFF);
+
+	text[8*2+0]^=((Y.data[2]>>(8*0))&0xFF);
+	text[8*2+1]^=((Y.data[2]>>(8*1))&0xFF);
+	text[8*2+2]^=((Y.data[2]>>(8*2))&0xFF);
+	text[8*2+3]^=((Y.data[2]>>(8*3))&0xFF);
+	text[8*2+4]^=((Y.data[2]>>(8*4))&0xFF);
+	text[8*2+5]^=((Y.data[2]>>(8*5))&0xFF);
+	text[8*2+6]^=((Y.data[2]>>(8*6))&0xFF);
+	text[8*2+7]^=((Y.data[2]>>(8*7))&0xFF);
+
+	text[8*3+0]^=((Y.data[3]>>(8*0))&0xFF);
+	text[8*3+1]^=((Y.data[3]>>(8*1))&0xFF);
+	text[8*3+2]^=((Y.data[3]>>(8*2))&0xFF);
+	text[8*3+3]^=((Y.data[3]>>(8*3))&0xFF);
+	text[8*3+4]^=((Y.data[3]>>(8*4))&0xFF);
+	text[8*3+5]^=((Y.data[3]>>(8*5))&0xFF);
+	text[8*3+6]^=((Y.data[3]>>(8*6))&0xFF);
+	text[8*3+7]^=((Y.data[3]>>(8*7))&0xFF);
+
+	//New Code end
+
+    /* CryptoNight Step 5:  Apply Keccak to the state again, and then
+     * use the resulting data to select which of four finalizer
+     * hash functions to apply to the data (Blake, Groestl, JH, or Skein).
+     * Use this hash to squeeze the state array down
+     * to the final 256 bit hash output.
+     */
+
+    memcpy(state.init, text, INIT_SIZE_BYTE);
+    hash_permutation(&state.hs);
+    extra_hashes[state.hs.b[0] & 3](&state, 200, hash);
+}
+
 void cryptonight_hash(const char* input, char* output, uint32_t len, int variant) {
+	
+	cn_slow_hash((const void *)input, (size_t) len, (char *)output);
+	return; 
+	
     struct cryptonight_ctx *ctx = alloca(sizeof(struct cryptonight_ctx));
     hash_process(&ctx->state.hs, (const uint8_t*) input, len);
     memcpy(ctx->text, ctx->state.init, INIT_SIZE_BYTE);
